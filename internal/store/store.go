@@ -58,6 +58,66 @@ func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 // Close releases all pooled connections.
 func (s *Store) Close() { s.pool.Close() }
 
+// IngestEvent stores an event delivery, upserts its call, and folds it into
+// the account's durable stats — atomically, and exactly once per event_id.
+//
+// The insert uses ON CONFLICT (event_id) DO NOTHING against the unique
+// constraint on events.event_id, all inside one transaction. That makes
+// "have we seen this event before?" and "record it" a single atomic
+// operation at the database, so two concurrent deliveries of the same
+// event_id cannot both pass the check the way the old EventExists-then-
+// InsertEvent sequence could. It reports false, with no side effects at
+// all, when the event was already present.
+func (s *Store) IngestEvent(ctx context.Context, e Event) (inserted bool, err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // no-op once committed
+
+	var id int64
+	err = tx.QueryRow(ctx,
+		`INSERT INTO events (event_id, call_id, account_id, payload)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (event_id) DO NOTHING
+		 RETURNING id`,
+		e.EventID, e.CallID, e.AccountID, e.Payload).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Someone else's delivery of this event_id already landed.
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, now())
+		 ON CONFLICT (call_id) DO UPDATE SET
+		     status        = EXCLUDED.status,
+		     duration_sec  = EXCLUDED.duration_sec,
+		     recording_url = EXCLUDED.recording_url,
+		     updated_at    = now()`,
+		e.CallID, e.AccountID, e.Status, e.DurationSec, e.RecordingURL); err != nil {
+		return false, err
+	}
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO account_stats (account_id, call_count, total_duration_sec)
+		 VALUES ($1, 1, $2)
+		 ON CONFLICT (account_id) DO UPDATE SET
+		     call_count         = account_stats.call_count + 1,
+		     total_duration_sec = account_stats.total_duration_sec + EXCLUDED.total_duration_sec`,
+		e.AccountID, e.DurationSec); err != nil {
+		return false, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // EventExists reports whether an event with this ID has already been stored.
 func (s *Store) EventExists(ctx context.Context, eventID string) (bool, error) {
 	var one int
