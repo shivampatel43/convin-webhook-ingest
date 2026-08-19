@@ -60,4 +60,13 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("shutdown", "err", err)
 	}
+
+	// srv.Shutdown only waits for HTTP handlers still executing. Ingest
+	// hands recording processing off to a background goroutine and
+	// returns immediately, so that work is almost certainly still running
+	// after srv.Shutdown returns. Wait for it too, within what's left of
+	// the same deadline, or it gets abandoned mid-run every deploy.
+	if err := svc.Shutdown(shutdownCtx); err != nil {
+		log.Error("shutdown: background work did not finish in time", "err", err)
+	}
 }
